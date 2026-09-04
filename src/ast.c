@@ -2,6 +2,7 @@
 #include "lilc/alloc.h"
 #include "lilc/array.h"
 #include "lilc/dynstr.h"
+#include <lilc/log.h>
 
 dyn_string_t p_expr_fmt(const p_ast_expr_t *expr, allocator_t *fmt_alloc) {
   dyn_string_t str = {0};
@@ -143,6 +144,7 @@ dyn_string_t p_type_fmt(const p_ast_type_t *ty, allocator_t *fmt_alloc) {
                       p_type_fmt(ty->u.array.elem_ty, fmt_alloc).string);
   } break;
   case P_TY_FUNC: {
+    log_debug("Func type");
     struct p_ast_type_func func = ty->u.func;
     dyn_string_printf(&str, "TY_FUNC(%s)",
                       p_type_fmt(func.ret_type, fmt_alloc).string);
@@ -164,6 +166,43 @@ dyn_string_t p_type_fmt(const p_ast_type_t *ty, allocator_t *fmt_alloc) {
   return str;
 }
 
+dyn_string_t p_desig_fmt(const p_ast_init_desig_t *desigs,
+                         allocator_t *fmt_alloc) {
+  dyn_string_t str = {0};
+  dyn_string_init(&str, fmt_alloc);
+
+  if (array_len(desigs) > 1) {
+    dyn_string_add_str(&str, "[");
+  }
+
+  p_ast_init_desig_t *desig;
+  array_foreach(desigs, desig) {
+    dyn_string_t desig_str;
+    switch (desig->kind) {
+    case P_INIT_DESIG_FIELD: {
+      desig_str =
+          dyn_string_makef(fmt_alloc, "DESIG_FIELD(%s)", desig->u.field);
+    } break;
+    case P_INIT_DESIG_INDEX: {
+      desig_str =
+          dyn_string_makef(fmt_alloc, "DESIG_INDEX(%s)",
+                           p_expr_fmt(desig->u.index, fmt_alloc).string);
+    } break;
+    }
+
+    dyn_string_add_str(&str, desig_str.string);
+    if (_arr_foreach_idx != array_len(desigs) - 1) {
+      dyn_string_add_str(&str, ", ");
+    }
+  }
+
+  if (array_len(desigs) > 1) {
+    dyn_string_add_str(&str, "]");
+  }
+
+  return str;
+}
+
 dyn_string_t p_init_fmt(const p_ast_init_t *init, allocator_t *fmt_alloc) {
   dyn_string_t str = {0};
   dyn_string_init(&str, fmt_alloc);
@@ -176,6 +215,12 @@ dyn_string_t p_init_fmt(const p_ast_init_t *init, allocator_t *fmt_alloc) {
     dyn_string_copy_str(&str, "INIT_LIST(");
     p_ast_init_item_t *init_item;
     array_foreach(init->u.list, init_item) {
+      if (init_item->desigs != NULL && array_len(init_item->desigs) != 0) {
+        dyn_string_add_str(&str,
+                           p_desig_fmt(init_item->desigs, fmt_alloc).string);
+        dyn_string_add_str(&str, " = ");
+      }
+
       dyn_string_add_str(&str, p_init_fmt(init_item->value, fmt_alloc).string);
       if (_arr_foreach_idx != array_len(init->u.list) - 1) {
         dyn_string_add_str(&str, ", ");
@@ -332,7 +377,7 @@ dyn_string_t p_declarator_fmt(const p_ast_declarator_t *decl, u64 indent,
   dyn_string_printf(&str, "%sDECL(%s, %s", str_indent.string,
                     p_type_fmt(&decl->type, fmt_alloc).string, decl->name);
   if (decl->has_init) {
-    dyn_string_add_str(&str, ", ");
+    dyn_string_add_str(&str, " = ");
     dyn_string_add_str(&str, p_init_fmt(&decl->init, fmt_alloc).string);
   }
 
@@ -364,11 +409,16 @@ dyn_string_t p_extern_fmt(const p_ast_extern_t *external,
   case P_EXT_DECL: {
     const p_ast_decl_t *decl = &external->u.decl;
 
-    if (array_len(decl->decls) == 1) {
+    if (array_len(decl->decls) == 0) {
+      dyn_string_printf(&str, "EXTERN_DECL(%s)",
+                        p_type_fmt(&decl->base_type, fmt_alloc).string);
+    } else if (array_len(decl->decls) == 1) {
       dyn_string_printf(&str, "EXTERN_%s",
                         p_declarator_fmt(&decl->decls[0], 0, fmt_alloc).string);
     } else {
-      dyn_string_printf(&str, "EXTERN_DECL(\n%s)",
+      log_debug("multi ext decl: %zu", array_len(decl->decls));
+      dyn_string_printf(&str, "EXTERN_DECL(%s)[\n%s]",
+                        p_type_fmt(&decl->base_type, fmt_alloc).string,
                         p_declarators_fmt(decl->decls, 2, fmt_alloc).string);
     }
 

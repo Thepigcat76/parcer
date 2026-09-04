@@ -313,23 +313,28 @@ void p_lexer_tokenize(p_lexer_t *lexer, const char *source,
         tok.kind = P_TOKEN_INTEGER;
         tok.int_kind = P_TOKEN_INT_DEC;
         u64 prefix_len = 0;
-        if (*lexer->cur_ch == '0') {
-          tok.int_kind = P_TOKEN_INT_OCT;
-          prefix_len = 1;
-          p_next_char(lexer);
-          if (tolower(*lexer->cur_ch) == 'b') {
+        if (*lexer->cur_ch == '0' && *(lexer->cur_ch + 1) != '\0') {
+          if (tolower(*(lexer->cur_ch + 1)) == 'b') {
             prefix_len = 2;
             tok.int_kind = P_TOKEN_INT_BIN;
-            p_next_char(lexer);
-          } else if (tolower(*lexer->cur_ch) == 'o') {
+          } else if (tolower(*(lexer->cur_ch + 1)) == 'o') {
             prefix_len = 2;
             tok.int_kind = P_TOKEN_INT_OCT;
-            p_next_char(lexer);
-          } else if (tolower(*lexer->cur_ch) == 'x') {
+          } else if (tolower(*(lexer->cur_ch + 1)) == 'x') {
             prefix_len = 2;
             tok.int_kind = P_TOKEN_INT_HEX;
+          } else if (isdigit(*(lexer->cur_ch + 1))) {
+            prefix_len = 1;
+            tok.int_kind = P_TOKEN_INT_OCT;
+          } else {
+            prefix_len = 0;
+            tok.int_literal = 0;
+          }
+
+          for (u64 i = 0; i < prefix_len; i++) {
             p_next_char(lexer);
           }
+          
         }
 
         // cur char is first digit of integer

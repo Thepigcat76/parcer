@@ -7,7 +7,7 @@
 #include <lilc/dynstr.h>
 #include <stdio.h>
 
-#define EXAMPLE_FILEPATH "examples/test0.c"
+#define EXAMPLE_FILEPATH "examples/func_ptr_test.c"
 
 int main(i32 argc, char **argv) {
   bump_t fmt_bump = {0};

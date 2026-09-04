@@ -55,8 +55,17 @@ typedef struct p_ast_enum_item {
   bool has_val;
 } p_ast_enum_item_t;
 
+typedef enum p_ast_type_qual {
+  P_TQ_NONE = 0,
+  P_TQ_CONST = 1 << 0,
+  P_TQ_VOLATILE = 1 << 1,
+  P_TQ_RESTRICT = 1 << 2,
+  P_TQ_ATOMIC = 1 << 3
+} p_ast_type_qual_e;
+
 struct p_ast_type {
   p_type_kind_e kind;
+  u32 quals; // p_ast_type_qual_e bitmask
   union p_ast_type_var {
     struct p_ast_type_ptr {
       p_ast_type_t *base_ty;
@@ -85,6 +94,7 @@ struct p_ast_type {
   } u;
 };
 
+// TODO: Add type qualifier to fields and pointers
 struct p_ast_field {
   char *name;
   p_ast_type_t ty;
@@ -268,14 +278,6 @@ typedef enum p_ast_storage_class {
   P_SC_REGISTER,
 } p_ast_storage_class_e;
 
-typedef enum p_ast_type_qual {
-  P_TQ_NONE = 0,
-  P_TQ_CONST = 1 << 0,
-  P_TQ_VOLATILE = 1 << 1,
-  P_TQ_RESTRICT = 1 << 2,
-  P_TQ_ATOMIC = 1 << 3
-} p_ast_type_qual_e;
-
 typedef struct p_ast_declarator {
   const char *name; // NULL for abstract declarator
   p_ast_type_t type;
@@ -285,7 +287,6 @@ typedef struct p_ast_declarator {
 
 struct p_ast_decl {
   p_ast_storage_class_e sc;
-  u32 quals; // p_ast_type_qual_e bitmask
   p_ast_type_t base_type;
   p_ast_declarator_t *decls;
 };
