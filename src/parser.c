@@ -2,15 +2,22 @@
 #include "lilc/alloc.h"
 #include "lilc/array.h"
 #include "lilc/assert.h"
+#include "lilc/eq.h"
+#include "lilc/hash.h"
 #include "lilc/log.h"
 #include "lilc/panic.h"
 #include "lilc/str.h"
 #include "lilc/todo.h"
-#include <unistd.h>
+#include <lilc/bump.h>
+#include <setjmp.h>
+#include <stdio.h>
 
 void p_parser_init(p_parser_t *parser) {
   bump_init(&parser->ast_bump, 16000);
   bump_allocator_init(&parser->ast_allocator, &parser->ast_bump);
+
+  hashmap_init(&parser->typedef_names, &parser->ast_allocator, char *,
+               p_ast_type_t, str_ptrv_hash, str_ptrv_eq, NULL);
 }
 
 void p_parser_deinit(p_parser_t *parser) { bump_free(&parser->ast_bump); }
@@ -52,11 +59,11 @@ static inline bool p_expect_peek_tok(p_parser_t *parser,
   return matches;
 }
 
-static inline bool p_check_cur_tok(p_parser_t *parser, p_tok_kind_e tok_kind) {
+static bool p_check_cur_tok(p_parser_t *parser, p_tok_kind_e tok_kind) {
   return parser->cur_tok->kind == tok_kind;
 }
 
-static inline bool p_check_peek_tok(p_parser_t *parser, p_tok_kind_e tok_kind) {
+static bool p_check_peek_tok(p_parser_t *parser, p_tok_kind_e tok_kind) {
   return parser->peek_tok->kind == tok_kind;
 }
 
@@ -91,18 +98,6 @@ static i32 p_builtin_type_idx(const char *ident) {
   return -1;
 }
 
-static p_ast_type_t p_ident_to_type(const char *ident, i32 builtin_ty_idx) {
-  p_ast_type_t type = {0};
-  if (builtin_ty_idx != -1) {
-    type.kind = glob_builtin_types[builtin_ty_idx].type_kind;
-    return type;
-  }
-
-  type.kind = P_TY_TYPEDEF_NAME;
-  type.u.typedef_name = ident;
-  return type;
-}
-
 struct p_storage_class {
   const char *name;
   p_ast_storage_class_e sc;
@@ -114,8 +109,8 @@ const struct p_storage_class glob_storage_classes[] = {
     {"register", P_SC_REGISTER},
 };
 
-static bool p_parse_decl_sc(p_parser_t *parser, p_ast_storage_class_e *sc) {
-  if (!p_check_cur_tok(parser, P_TOKEN_IDENT)) {
+static bool p_parse_decl_sc(p_tok_t token, p_ast_storage_class_e *sc) {
+  if (token.kind != P_TOKEN_IDENT) {
     if (sc != NULL) {
       *sc = P_SC_NONE;
     }
@@ -124,7 +119,7 @@ static bool p_parse_decl_sc(p_parser_t *parser, p_ast_storage_class_e *sc) {
 
   for (u64 i = 0;
        i < sizeof(glob_storage_classes) / sizeof(struct p_storage_class); i++) {
-    if (str_eq(parser->cur_tok->ident_literal, glob_storage_classes[i].name)) {
+    if (str_eq(token.ident_literal, glob_storage_classes[i].name)) {
       if (sc != NULL) {
         *sc = glob_storage_classes[i].sc;
       }
@@ -151,14 +146,14 @@ const struct p_type_qual glob_type_quals[] = {
     {"atomic", P_TQ_ATOMIC},
 };
 
-static bool p_parse_type_qual(p_parser_t *parser, u32 *quals) {
-  if (!p_check_cur_tok(parser, P_TOKEN_IDENT)) {
+static bool p_parse_type_qual(p_tok_t token, u32 *quals) {
+  if (token.kind != P_TOKEN_IDENT) {
     return false;
   }
 
   for (u64 i = 0; i < sizeof(glob_type_quals) / sizeof(struct p_type_qual);
        i++) {
-    if (str_eq(parser->cur_tok->ident_literal, glob_type_quals[i].name)) {
+    if (str_eq(token.ident_literal, glob_type_quals[i].name)) {
       if (quals != NULL) {
         *quals |= glob_type_quals[i].qual;
       }
@@ -169,15 +164,43 @@ static bool p_parse_type_qual(p_parser_t *parser, u32 *quals) {
   return false;
 }
 
-enum p_type_parse_context {
+static p_ast_type_t p_ident_to_type(const char *ident, i32 builtin_ty_idx) {
+  p_ast_type_t type = {0};
+  if (builtin_ty_idx != -1) {
+    type.kind = glob_builtin_types[builtin_ty_idx].type_kind;
+    return type;
+  }
+
+  type.kind = P_TY_TYPEDEF_NAME;
+  type.u.typedef_name = ident;
+  return type;
+}
+
+static bool p_is_type_ident(p_parser_t *parser, const char *ty_ident,
+                            i32 *builtin_ty_idx) {
+  i32 _builtin_ty_idx = p_builtin_type_idx(ty_ident);
+  if (builtin_ty_idx != NULL) {
+    *builtin_ty_idx = _builtin_ty_idx;
+  }
+  if (_builtin_ty_idx != -1) {
+    return true;
+  }
+
+  return hashmap_contains(&parser->typedef_names, &ty_ident);
+}
+
+enum p_declarator_parse_context {
   P_TY_PARSE_CTX_FUNC_ARG,
-  P_TY_PARSE_CTX_FUNC_RET,
+  P_TY_PARSE_CTX_REC_FIELD,
   P_TY_PARSE_CTX_DECL,
 };
 
-static bool p_parse_type(p_parser_t *parser, p_ast_type_t *type,
-                         char **decl_name, p_ast_storage_class_e *sc,
-                         enum p_type_parse_context type_parse_ctx);
+static bool p_parse_init(p_parser_t *parser, p_ast_init_t *init);
+
+static bool p_parse_declarators(p_parser_t *parser, p_ast_type_t *base_ty,
+                                p_ast_declarator_t **declarators,
+                                p_ast_arg_t *arg, p_ast_storage_class_e *sc,
+                                enum p_declarator_parse_context parse_ctx);
 
 // cur_tok is union/struct ident
 static bool p_parse_rec_type(p_parser_t *parser, p_type_kind_e type_kind,
@@ -197,32 +220,22 @@ static bool p_parse_rec_type(p_parser_t *parser, p_type_kind_e type_kind,
     has_tag = true;
   }
 
-  rec_type->fields = array_new(p_ast_field_t, &parser->ast_allocator);
+  rec_type->fields = array_new(p_ast_rec_field_t, &parser->ast_allocator);
 
   if (p_expect_cur_tok(parser, P_TOKEN_LCURLY)) {
     while (!p_check_cur_tok(parser, P_TOKEN_RCURLY)) {
-      p_ast_field_t field = {};
+      p_ast_rec_field_t field = {
+          .decls = array_new(p_ast_declarator_t, &parser->ast_allocator)};
       // TODO: Fix these parameters
       bool field_success =
-          p_parse_type(parser, &field.ty, NULL, NULL, P_TY_PARSE_CTX_DECL);
+          p_parse_declarators(parser, &field.base_type, &field.decls, NULL,
+                              NULL, P_TY_PARSE_CTX_REC_FIELD);
       if (!field_success) {
         log_error("Failed to parse type for %s field", record_kind);
         return false;
       }
 
-      p_next_token(parser);
-
-      if (p_expect_cur_tok(parser, P_TOKEN_IDENT)) {
-        field.name = parser->cur_tok->ident_literal;
-      }
-
       array_add(rec_type->fields, field);
-
-      if (!p_expect_cur_tok(parser, P_TOKEN_SEMICOLON)) {
-        log_error("Expected token semicolon after %s field, received token: %s",
-                  record_kind, p_cur_tok_fmt(parser));
-        return false;
-      }
     }
     rec_type->is_complete = true;
   } else if (has_tag) {
@@ -283,48 +296,34 @@ static bool p_parse_enum_type(p_parser_t *parser,
   return true;
 }
 
-static bool p_is_type_ident(p_parser_t *parser, const char *ty_ident,
-                            i32 *builtin_ty_idx) {
-  i32 _builtin_ty_idx = p_builtin_type_idx(ty_ident);
-  if (builtin_ty_idx != NULL) {
-    *builtin_ty_idx = _builtin_ty_idx;
-  }
-  if (_builtin_ty_idx != -1) {
-    return true;
-  }
-
-  return hashmap_contains(&parser->typedef_names, &ty_ident);
-}
-
 // Cur tok is first field or end_tok
-static bool p_parse_field_list(p_parser_t *parser, p_ast_field_t **fields,
-                               bool function_arg, p_tok_kind_e sep_tok,
-                               bool allow_trailing_sep, p_tok_kind_e end_tok) {
-  while (!p_check_cur_tok(parser, end_tok)) {
+static bool p_parse_args_list(p_parser_t *parser, p_ast_arg_t **args) {
+  while (!p_check_cur_tok(parser, P_TOKEN_RPAREN)) {
     log_debug("Parsing args");
-    p_ast_field_t field = {0};
-    bool ty_success = p_parse_type(parser, &field.ty, &field.name, NULL,
-                                   function_arg ? P_TY_PARSE_CTX_FUNC_ARG
-                                                : P_TY_PARSE_CTX_DECL);
+    p_ast_arg_t arg = {0};
+    bool ty_success = p_parse_declarators(parser, &arg.ty, NULL, &arg, NULL,
+                                          P_TY_PARSE_CTX_FUNC_ARG);
     if (!ty_success) {
       log_error("Failed to parse type in field list");
       return false;
     }
 
-    if (field.name == NULL && p_expect_peek_tok(parser, P_TOKEN_IDENT)) {
-      field.name = parser->cur_tok->ident_literal;
+    if (arg.name == NULL && p_expect_peek_tok(parser, P_TOKEN_IDENT)) {
+      arg.name = parser->cur_tok->ident_literal;
     }
 
-    array_add(*fields, field);
+    array_add(*args, arg);
 
-    if (p_expect_peek_tok(parser, sep_tok)) {
-      if (p_check_peek_tok(parser, end_tok) && !allow_trailing_sep) {
-        log_error("Trailing seperator not allowed in fields list");
+    if (p_expect_cur_tok(parser, P_TOKEN_COMMA)) {
+      if (p_check_cur_tok(parser, P_TOKEN_RPAREN)) {
+        log_error("Trailing comma not allowed in args list");
         return false;
       }
       p_next_token(parser);
-    } else if (!p_expect_peek_tok(parser, end_tok)) {
-      log_error("Expected seperator or end token after field list entry");
+    } else if (!p_check_cur_tok(parser, P_TOKEN_RPAREN)) {
+      log_error("Expected comma or right parenthesis after arg list entry, "
+                "received token: %s",
+                p_cur_tok_fmt(parser));
       return false;
     }
   }
@@ -332,76 +331,236 @@ static bool p_parse_field_list(p_parser_t *parser, p_ast_field_t **fields,
   return true;
 }
 
-// Type is the return type of the function pointer and the output type
-// cur_tok is left parenthesis of function pointer
-// or star or ident if function is an arg
-static bool p_parse_func_pointer_type(p_parser_t *parser, char **func_name,
-                                      p_ast_type_t *type,
-                                      enum p_type_parse_context ctx) {
-  i32 nesting = 1;
-  if (!p_expect_cur_tok(parser, P_TOKEN_LPAREN)) {
-    log_error("Expected left parenthesis at beginning of function pointer "
-              "type, received token: %s",
-              p_cur_tok_fmt(parser));
+static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr);
+
+static bool p_parse_base_type(p_parser_t *parser, p_ast_type_t *base_ty) {
+  if (!p_check_cur_tok(parser, P_TOKEN_IDENT)) {
+    log_error("Expected ident for base type parsing");
     return false;
   }
 
-  if (!p_expect_cur_tok(parser, P_TOKEN_STAR)) {
-    log_error("Expected token star after left parenthesis of function "
-              "pointer type");
-    return false;
-  }
-
-  for (;;) {
-    bool qual_success = p_parse_type_qual(parser, &type->quals);
-    if (qual_success) {
-      p_next_token(parser);
-    } else if (p_check_cur_tok(parser, P_TOKEN_LPAREN)) {
-      nesting++;
-      p_next_token(parser);
-    } else if (p_check_cur_tok(parser, P_TOKEN_IDENT)) {
-      *func_name = parser->cur_tok->ident_literal;
-    }
-  }
-
+  i32 builtin_ty_idx = 0;
   char *ident = parser->cur_tok->ident_literal;
-  if (!p_expect_cur_tok(parser, P_TOKEN_IDENT)) {
-    log_error("Expected func pointer name");
+
+  if (str_eq(ident, "struct")) {
+    base_ty->kind = P_TY_STRUCT;
+    bool struct_ty_success =
+        p_parse_rec_type(parser, P_TY_STRUCT, &base_ty->u.rec);
+    if (!struct_ty_success) {
+      log_error("Failed to parse struct type");
+      return false;
+    }
+  } else if (str_eq(ident, "union")) {
+    base_ty->kind = P_TY_UNION;
+    bool union_ty_success =
+        p_parse_rec_type(parser, P_TY_UNION, &base_ty->u.rec);
+    if (!union_ty_success) {
+      log_error("Failed to parse union type");
+      return false;
+    }
+  } else if (str_eq(ident, "enum")) {
+    base_ty->kind = P_TY_ENUM;
+    bool en_ty_success = p_parse_enum_type(parser, &base_ty->u.en);
+    if (!en_ty_success) {
+      log_error("Failed to parse enum type");
+      return false;
+    }
+  } else if (p_is_type_ident(parser, ident, &builtin_ty_idx)) {
+    *base_ty = p_ident_to_type(ident, builtin_ty_idx);
+  } else {
+    log_error("Ident is not a type");
     return false;
   }
-
-  *func_name = ident;
-
-  log_debug("Func ptr name: %s", ident);
-
-  if (!p_expect_cur_tok(parser, P_TOKEN_RPAREN)) {
-    log_error("Expected right parenthesis after func ptr name");
-    return false;
-  }
-
-  if (!p_expect_cur_tok(parser, P_TOKEN_LPAREN)) {
-    log_error("Expected left parenthesis after func ptr name");
-    return false;
-  }
-
-  p_ast_type_t ret_type = *type;
-  type->u.func.ret_type = bump_alloc(&parser->ast_bump, sizeof(p_ast_type_t));
-  *type->u.func.ret_type = ret_type;
-  type->kind = P_TY_FUNC;
-  type->u.func.args = array_new(p_ast_field_t, &parser->ast_allocator);
-  bool field_list_success = p_parse_field_list(
-      parser, &type->u.func.args, true, P_TOKEN_COMMA, false, P_TOKEN_RPAREN);
-  if (!field_list_success) {
-    log_error("Failed to parse args for function ptr type");
-    return false;
-  }
-
-  log_debug("Done parsing func ptr, cur tok: %s", p_cur_tok_fmt(parser));
 
   return true;
 }
 
-static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr);
+struct p_ptr_chunk {
+  u32 type_quals;
+  u32 nesting;
+};
+
+struct p_decl_suf {
+  bool is_array;
+  u32 nesting;
+  union {
+    struct {
+      p_ast_expr_t count_expr;
+      bool has_count;
+      bool is_vla;
+    } array;
+    struct {
+      p_ast_arg_t *args;
+      bool variadic;
+    } func;
+  } u;
+};
+
+typedef enum {
+  DECL_OP_SUFFIX,
+  DECL_OP_POINTER,
+} p_decl_op_kind_e;
+
+typedef struct {
+  p_decl_op_kind_e kind;
+  u32 nesting;
+  u32 order; // stable tie-break
+  union {
+    struct p_decl_suf *suf;
+    struct p_ptr_chunk *ptr;
+  } u;
+} p_decl_op_t;
+
+static inline void p_apply_array_ty_suffix(p_ast_type_t *ty, bump_t *ast_bump,
+                                           struct p_decl_suf *suf) {
+  (void)suf; // if you later need qualifiers/static/vla info, use this
+  p_ast_type_t out = {
+      .kind = P_TY_ARRAY,
+      .u.array =
+          {
+              .elem_ty = bump_alloc(ast_bump, sizeof(p_ast_type_t)),
+              .count = bump_alloc(ast_bump, sizeof(p_ast_expr_t)),
+          },
+  };
+  *out.u.array.elem_ty = *ty;
+  *out.u.array.count = suf->u.array.count_expr;
+  out.u.array.has_count = suf->u.array.has_count;
+  *ty = out;
+}
+
+static inline void p_apply_func_ty_suffix(p_ast_type_t *ty, bump_t *ast_bump,
+                                          struct p_decl_suf *suf) {
+  p_ast_type_t out = {
+      .kind = P_TY_FUNC,
+      .u.func =
+          {
+              .ret_type = bump_alloc(ast_bump, sizeof(p_ast_type_t)),
+              .args = suf->u.func.args,
+          },
+  };
+  *out.u.func.ret_type = *ty;
+  *ty = out;
+}
+
+static inline void p_apply_ty_suffix(p_ast_type_t *ty, bump_t *ast_bump,
+                                     struct p_decl_suf *suf) {
+  if (suf->is_array) {
+    p_apply_array_ty_suffix(ty, ast_bump, suf);
+  } else {
+    p_apply_func_ty_suffix(ty, ast_bump, suf);
+  }
+}
+
+static inline void p_apply_pointer(p_ast_type_t *ty, bump_t *ast_bump,
+                                   struct p_ptr_chunk *ptr) {
+  p_ast_type_t out = {
+      .kind = P_TY_PTR,
+      .quals = ptr->type_quals,
+      .u.ptr.base_ty = bump_alloc(ast_bump, sizeof(p_ast_type_t)),
+  };
+  *out.u.ptr.base_ty = *ty;
+  *ty = out;
+}
+
+// return >0 if a before b
+static int p_cmp_decl_op(const p_decl_op_t *a, const p_decl_op_t *b) {
+  if (a->nesting != b->nesting) {
+    // higher nesting (inner) first
+    return (a->nesting > b->nesting) ? 1 : -1;
+  }
+
+  // same nesting: suffix before pointer (C declarator precedence)
+  if (a->kind != b->kind) {
+    return (a->kind == DECL_OP_SUFFIX) ? 1 : -1;
+  }
+
+  // stable source order
+  if (a->order < b->order)
+    return 1;
+  if (a->order > b->order)
+    return -1;
+  return 0;
+}
+
+void p_apply_decl_chunks(p_ast_type_t *ty, struct p_ptr_chunk **ptr_chunks,
+                         struct p_decl_suf **suffixes, bump_t *ast_bump,
+                         allocator_t *ast_allocator) {
+  p_decl_op_t *ops = array_new(p_decl_op_t, ast_allocator);
+  u32 ord = 0;
+
+  for (u64 i = 0; i < array_len(*suffixes); i++) {
+    p_decl_op_t op = {
+        .kind = DECL_OP_SUFFIX,
+        .nesting = (*suffixes)[i].nesting,
+        .order = ord++,
+        .u.suf = &(*suffixes)[i],
+    };
+    array_add(ops, op);
+  }
+
+  for (u64 i = 0; i < array_len(*ptr_chunks); i++) {
+    p_decl_op_t op = {
+        .kind = DECL_OP_POINTER,
+        .nesting = (*ptr_chunks)[i].nesting,
+        .order = ord++,
+        .u.ptr = &(*ptr_chunks)[i],
+    };
+    array_add(ops, op);
+  }
+
+  qsort(ops, array_len(ops), sizeof(ops[0]),
+        (int (*)(const void *, const void *))p_cmp_decl_op);
+
+  for (u64 i = 0; i < array_len(ops); i++) {
+    if (ops[i].kind == DECL_OP_SUFFIX) {
+      printf("SUFFIX OP\n");
+      p_apply_ty_suffix(ty, ast_bump, ops[i].u.suf);
+    } else {
+      printf("POINTER OP\n");
+      p_apply_pointer(ty, ast_bump, ops[i].u.ptr);
+    }
+  }
+
+  array_free(ops);
+}
+
+static bool p_resolve_declarator(p_parser_t *parser,
+                                 p_ast_declarator_t *declarator,
+                                 p_ast_type_t base_ty,
+                                 struct p_ptr_chunk **ptr_chunks,
+                                 struct p_decl_suf **suffixes) {
+  declarator->type = base_ty;
+
+  if (declarator->name == NULL) {
+    if (array_len(*ptr_chunks) != 0 || array_len(*suffixes) != 0) {
+      log_error("Declarator without name is not allowed to have pointer, array "
+                "or function type");
+      return false;
+    }
+    declarator->has_init = false;
+    return true;
+  }
+
+  log_debug("Applying decl chunks");
+
+  struct p_ptr_chunk *ptr_chunk;
+  array_foreach(*ptr_chunks, ptr_chunk) {
+    printf("POINTERCHUNK nesting: %u\n", ptr_chunk->nesting);
+  }
+
+  struct p_ptr_chunk *decl_suf;
+  array_foreach(*suffixes, decl_suf) {
+    printf("SUFFIXCHUNK nesting: %u\n", decl_suf->nesting);
+  }
+
+  p_apply_decl_chunks(&declarator->type, ptr_chunks, suffixes,
+                      &parser->ast_bump, &parser->ast_allocator);
+
+  array_clear(*ptr_chunks);
+  array_clear(*suffixes);
+
+  return true;
+}
 
 // TYPE PARSING
 // - check for type qualifiers, storage class
@@ -426,232 +585,289 @@ static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr);
 // int **const x ; const applies to inner intptr
 // int *(*const x) ; const applies to inner intptr
 
-// Parameters type_quals, decl_name and sc are allowed to be NULL if we do not
-// care about them
-static bool p_parse_type(p_parser_t *parser, p_ast_type_t *type,
-                         char **decl_name, p_ast_storage_class_e *sc,
-                         enum p_type_parse_context ty_parse_ctx) {
-  ASSERT(type != NULL, "Type cant be null");
+// cur_tok is first token of decl
+// cur_tok at the end is last token of the decl (semicolon/left-curly/comma
+// (comma only when parsing function arguemnt))
+static bool p_parse_declarators(p_parser_t *parser, p_ast_type_t *base_ty,
+                                p_ast_declarator_t **declarators,
+                                p_ast_arg_t *arg, p_ast_storage_class_e *sc,
+                                enum p_declarator_parse_context parse_ctx) {
 
-  typedef struct p_ptr_chunk {
-    u32 quals;
-    u32 nesting;
-  } p_ptr_chunk_t;
+  struct p_ptr_chunk *ptr_chunks =
+      array_new(struct p_ptr_chunk, &parser->ast_allocator);
+  struct p_decl_suf *decl_suffixes =
+      array_new(struct p_decl_suf, &parser->ast_allocator);
 
-  typedef struct p_decl_suffix {
-    enum p_decl_suffix_kind {
-      P_DECL_SUF_FUNC,
-      P_DECL_SUF_ARRAY,
-    } kind;
-    union p_decl_suffix_var {
-      struct p_decl_suffix_func {
-        p_ast_field_t *args;
-        bool variadic;
-      } func;
-      struct p_decl_suffix_array {
-        p_ast_expr_t count;
-        bool has_count;
-        bool is_vla;
-      } array;
-    } u;
-    u32 nesting;
-  } p_decl_suffix_t;
+  bool sc_allowed = parse_ctx == P_TY_PARSE_CTX_DECL;
+  bool type_qual_allowed = true;
 
-  p_ptr_chunk_t *ptr_chunks = array_new(p_ptr_chunk_t, &parser->ast_allocator);
-  p_decl_suffix_t *decl_suffixes =
-      array_new(p_decl_suffix_t, &parser->ast_allocator);
+  bool parsing_ptr = false;
+  struct p_ptr_chunk cur_ptr_chunk = {0};
 
-  p_ptr_chunk_t cur_ptr_chunk = {0};
-  bool parsing_pointer = false;
-  u32 nesting = 0;
+  bool parsing_declarator = false;
+  p_ast_declarator_t cur_declarator = {0};
 
-  bool parsing_type_qual = true;
-  bool parsing_sc = true;
+  u32 cur_nesting = 0;
 
-  bool found_ty = false;
-  bool found_name = false;
-
-  for (;;) {
-    log_debug("Parsing type, cur tok: %s", p_cur_tok_fmt(parser));
-    bool type_qual_success =
-        parsing_type_qual
-            ? p_parse_type_qual(parser, nesting == 0 ? &type->quals
-                                                     : &cur_ptr_chunk.quals)
-            : false;
-    if (type_qual_success) {
-      p_next_token(parser);
-    }
-
-    bool sc_success = parsing_sc ? p_parse_decl_sc(parser, sc) : false;
-    if (sc_success) {
-      p_next_token(parser);
-    }
-
-    log_debug("Found ty: %d, cur tok: %s", found_ty, p_cur_tok_fmt(parser));
-
-    if (p_check_cur_tok(parser, P_TOKEN_IDENT) && !found_name) {
-      char *ident = parser->cur_tok->ident_literal;
-
-      if (found_ty) {
-        if (decl_name != NULL) {
-          *decl_name = ident;
-        }
-        found_name = true;
-        if (parsing_pointer) {
-          array_add(ptr_chunks, cur_ptr_chunk);
-          parsing_pointer = false;
-        }
-        p_next_token(parser);
-      } else {
-        bool rec_type = false;
-
-        i32 builtin_ty_idx = 0;
-
-        if (str_eq(ident, "union")) {
-          rec_type = true;
-          type->kind = P_TY_UNION;
-        } else if (str_eq(ident, "struct")) {
-          rec_type = true;
-          type->kind = P_TY_STRUCT;
-        } else if (str_eq(ident, "enum")) {
-          type->kind = P_TY_ENUM;
-          found_ty = true;
-          bool enum_ty_success = p_parse_enum_type(parser, &type->u.en);
-          if (!enum_ty_success) {
-            log_error("Failed to parse enum type");
-            return false;
-          }
-        } else if (p_is_type_ident(parser, ident, &builtin_ty_idx)) {
-          found_ty = true;
-          *type = p_ident_to_type(ident, builtin_ty_idx);
-          p_next_token(parser);
-          log_debug("Found type: %s", found_ty ? "true" : "false");
-          sleep(1);
-        } else {
-          log_error("Encountered ident %s while parsing type, expected type "
-                    "name, type qualifier or storage class",
-                    ident);
-          return false;
-        }
-
-        if (rec_type) {
-          bool rec_type_success =
-              p_parse_rec_type(parser, type->kind, &type->u.rec);
-          if (!rec_type_success) {
-            log_error("Failed to parse record type");
-            return false;
-          }
-
-          found_ty = true;
-        }
+  // Run infinite loop until we run into an end token
+  // For regular decls the end token is semicolon/right curly
+  // For function arguments the end token is comma/right parenthesis with
+  // nesting 0
+  for (;; p_next_token(parser)) {
+    if (p_check_cur_tok(parser, P_TOKEN_SEMICOLON) ||
+        p_check_cur_tok(parser, P_TOKEN_LCURLY)) {
+      if (parse_ctx == P_TY_PARSE_CTX_FUNC_ARG) {
+        log_error("Encountered illegal token semicolon/left curly bracket "
+                  "while parsing function argument");
+        return false;
       }
-    } else if (found_ty) {
-      if (!found_name) {
-        switch (parser->cur_tok->kind) {
-        case P_TOKEN_LPAREN: {
-          parsing_sc = false;
-          parsing_type_qual = false;
 
-          nesting++;
-          p_next_token(parser);
-        } break;
-        case P_TOKEN_STAR: {
-          parsing_sc = false;
-          parsing_type_qual = true;
+      if (cur_nesting != 0) {
+        log_error("Encountered semicolon but expected right parenthesis while "
+                  "parsing decl");
+        return false;
+      }
 
-          if (parsing_pointer) {
-            array_add(ptr_chunks, cur_ptr_chunk);
-          }
-          cur_ptr_chunk.nesting = nesting;
-          cur_ptr_chunk.quals = 0;
-          parsing_pointer = true;
-          p_next_token(parser);
-        } break;
-        case P_TOKEN_SEMICOLON: {
-          if (ty_parse_ctx == P_TY_PARSE_CTX_FUNC_ARG) {
-            log_error(
-                "Encountered token semicolon while parsing function args");
-            return false;
-          } else {
-            goto end_of_type_parsing_loop;
-          }
-        } break;
-        default: {
-          log_error("Unexpected token while parsing type: %s",
-                    p_cur_tok_fmt(parser));
-          return false;
-        } break;
+      bool resolved_decl = p_resolve_declarator(
+          parser, &cur_declarator, *base_ty, &ptr_chunks, &decl_suffixes);
+      if (!resolved_decl) {
+        log_error("Failed to resolve declarator");
+        return false;
+      }
+      array_add(*declarators, cur_declarator);
+      break;
+    } else if (parse_ctx == P_TY_PARSE_CTX_FUNC_ARG &&
+               (p_check_cur_tok(parser, P_TOKEN_COMMA) ||
+                (p_check_cur_tok(parser, P_TOKEN_RPAREN) &&
+                 cur_nesting == 0))) {
+
+      bool resolved_decl = p_resolve_declarator(
+          parser, &cur_declarator, *base_ty, &ptr_chunks, &decl_suffixes);
+      if (!resolved_decl) {
+        log_error("Failed to resolve arg");
+        return false;
+      }
+
+      arg->name = cur_declarator.name;
+      arg->ty = cur_declarator.type;
+
+      break;
+    }
+
+    log_debug("[PARSING-DECL] Cur tok: %s", p_cur_tok_fmt(parser));
+
+    bool sc_parse_success = p_parse_decl_sc(*parser->cur_tok, sc);
+    if (sc_parse_success) {
+      if (!sc_allowed) {
+        log_error(
+            "Storage class specififer not allowed at this position in decl");
+        return false;
+      }
+      continue;
+    }
+
+    bool type_qual_sucess = p_parse_type_qual(
+        *parser->cur_tok,
+        parsing_ptr ? &cur_ptr_chunk.type_quals : &base_ty->quals);
+    if (type_qual_sucess) {
+      if (!type_qual_allowed) {
+        log_error("Type qualifier not allowed at this position in decl");
+        return false;
+      }
+      continue;
+    }
+
+    if (p_check_cur_tok(parser, P_TOKEN_IDENT)) {
+      if (parsing_declarator) {
+        log_debug("Parsing declarator, %s", parser->cur_tok->ident_literal);
+        cur_declarator.name = parser->cur_tok->ident_literal;
+        sc_allowed = false;
+        type_qual_allowed = false;
+        if (parsing_ptr) {
+          array_add(ptr_chunks, cur_ptr_chunk);
+          parsing_ptr = false;
         }
       } else {
-        switch (parser->cur_tok->kind) {
-        case P_TOKEN_LSQUARE: {
-          p_decl_suffix_t suf = {
-              .kind = P_DECL_SUF_ARRAY,
-              .nesting = nesting,
-          };
+        bool base_ty_success = p_parse_base_type(parser, base_ty);
+        if (!base_ty_success) {
+          log_error("Failed to parse base type of decl");
+          return false;
+        }
+
+        parsing_declarator = true;
+      }
+
+      continue;
+    }
+
+    // Parsing pointer and parenthesis before declarator name
+    if (parsing_declarator && cur_declarator.name == NULL) {
+      switch (parser->cur_tok->kind) {
+      case P_TOKEN_LPAREN: {
+        if (parsing_ptr) {
+          array_add(ptr_chunks, cur_ptr_chunk);
+        }
+        parsing_ptr = false;
+        sc_allowed = false;
+        type_qual_allowed = false;
+        cur_nesting++;
+        goto end_of_decl_loop;
+      } break;
+      case P_TOKEN_STAR: {
+        if (parsing_ptr) {
+          array_add(ptr_chunks, cur_ptr_chunk);
+        }
+        log_debug("ENCOUNTERED STAR TOKEN");
+        parsing_ptr = true;
+        type_qual_allowed = true;
+        sc_allowed = false;
+        cur_ptr_chunk.nesting = cur_nesting;
+        cur_ptr_chunk.type_quals = 0;
+        goto end_of_decl_loop;
+      } break;
+      default: {
+        log_error("Unexpected token %s while parsing decl pre-name, line: %d, "
+                  "name: %s",
+                  p_cur_tok_fmt(parser), parser->cur_tok->line,
+                  cur_declarator.name);
+        return false;
+      } break;
+      }
+    }
+    // Parsing array, functions, closing parenthesis, comma after declarator
+    // name
+    else if (parsing_declarator && cur_declarator.name != NULL) {
+      switch (parser->cur_tok->kind) {
+      case P_TOKEN_RPAREN: {
+        cur_nesting--;
+        goto end_of_decl_loop;
+      } break;
+      case P_TOKEN_LSQUARE: {
+        log_debug("Found array");
+        struct p_decl_suf decl_suf = {.is_array = true, .nesting = cur_nesting};
+        if (p_expect_peek_tok(parser, P_TOKEN_RSQUARE)) {
+          decl_suf.u.array.has_count = false;
+        } else {
+          p_next_token(parser);
+
+          bool count_success =
+              p_parse_expr(parser, &decl_suf.u.array.count_expr);
+          if (!count_success) {
+            log_error("Failed to parse count of array");
+            return false;
+          }
+
+          decl_suf.u.array.has_count = true;
 
           if (!p_expect_peek_tok(parser, P_TOKEN_RSQUARE)) {
-            p_next_token(parser);
-            bool array_success = p_parse_expr(parser, &suf.u.array.count);
-            if (!array_success) {
-              log_error("Failed to parse array count");
-              return false;
-            }
-            suf.u.array.has_count = true;
-
-            if (!p_expect_peek_tok(parser, P_TOKEN_RSQUARE)) {
-              log_error("Expected right square bracket after array count expr");
-              return false;
-            }
-          }
-
-          array_add(decl_suffixes, suf);
-        } break;
-        case P_TOKEN_LPAREN: {
-          p_decl_suffix_t suf = {
-              .kind = P_DECL_SUF_FUNC,
-              .nesting = nesting,
-          };
-
-          p_next_token(parser);
-
-          suf.u.func.args = array_new(p_ast_field_t, &parser->ast_allocator);
-          bool args_success =
-              p_parse_field_list(parser, &suf.u.func.args, true, P_TOKEN_COMMA,
-                                 false, P_TOKEN_RPAREN);
-          if (!args_success) {
-            log_error("Failed to parse args for function type");
+            log_error("Expected right square token after array count expr");
             return false;
           }
+        }
+        array_add(decl_suffixes, decl_suf);
+        goto end_of_decl_loop;
+      } break;
+      case P_TOKEN_LPAREN: {
+        struct p_decl_suf decl_suf = {
+            .is_array = false,
+            .nesting = cur_nesting,
+            .u.func.args = array_new(p_ast_arg_t, &parser->ast_allocator),
+        };
 
-          array_add(decl_suffixes, suf);
-        } break;
-        case P_TOKEN_RPAREN: {
-          nesting--;
-          p_next_token(parser);
-        } break;
-        default: {
-          log_error("Unexpected token while parsing type %s",
-                    p_cur_tok_fmt(parser));
+        bool args_success = p_parse_args_list(parser, &decl_suf.u.func.args);
+        if (!args_success) {
+          log_error("Failed to parse args of function type");
           return false;
         }
+
+        array_add(decl_suffixes, decl_suf);
+        goto end_of_decl_loop;
+      } break;
+      case P_TOKEN_COMMA: {
+        log_debug("Found comma");
+        ASSERT(parse_ctx != P_TY_PARSE_CTX_FUNC_ARG,
+               "Handled comma in func arg the wrong way");
+
+        if (cur_nesting != 0) {
+          log_error("Encountered comma but expected right parenthesis while "
+                    "parsing decl");
+          return false;
         }
+
+        bool resolved_decl = p_resolve_declarator(
+            parser, &cur_declarator, *base_ty, &ptr_chunks, &decl_suffixes);
+        if (!resolved_decl) {
+          log_error("Failed to resolve declarator");
+          return false;
+        }
+        array_add(*declarators, cur_declarator);
+
+        memset(&cur_declarator, 0, sizeof(p_ast_declarator_t));
+
+        goto end_of_decl_loop;
+
+        // TODO: Handle ptr chunks and decl suffixes
+
+      } break;
+      case P_TOKEN_ASSIGN: {
+        if (parse_ctx != P_TY_PARSE_CTX_DECL) {
+          log_error("Unexpected token assign while parsing %s",
+                    parse_ctx == P_TY_PARSE_CTX_REC_FIELD ? "field"
+                                                          : "function arg");
+          return false;
+        }
+
+        if (cur_nesting != 0) {
+          log_error("Encountered assign but expected right parenthesis while "
+                    "parsing decl");
+          return false;
+        }
+
+        p_next_token(parser);
+
+        bool init_success = p_parse_init(parser, &cur_declarator.init);
+        if (!init_success) {
+          log_error("Failed to parse init for decl");
+          return false;
+        }
+
+        cur_declarator.has_init = true;
+
+        if (!p_check_peek_tok(parser, P_TOKEN_COMMA) &&
+            !p_check_peek_tok(parser, P_TOKEN_SEMICOLON)) {
+          log_error("Expected comma or semicolon after assign");
+          return false;
+        }
+
+        goto end_of_decl_loop;
+      }
+      default: {
+        log_error("Unexpected token %s while parsing decl post-name",
+                  p_cur_tok_fmt(parser));
+        return false;
+      } break;
       }
     }
-  }
-end_of_type_parsing_loop:
 
-  log_debug("Done parsign type");
-  exit(0);
+  end_of_decl_loop:
+    continue;
+  }
+
+  if (array_len(decl_suffixes) == 0) {
+    struct p_ptr_chunk *chunk;
+    array_foreach(ptr_chunks, chunk) {}
+  }
+
   return true;
 }
 
 static bool p_parse_stmt(p_parser_t *parser, p_ast_stmt_t *stmt);
 
-static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr) {
+static bool p_parse_base_expr(p_parser_t *parser, p_ast_expr_t *expr) {
   switch (parser->cur_tok->kind) {
   case P_TOKEN_IDENT: {
-
+    expr->kind = P_EX_IDENT;
+    expr->u.ident = parser->cur_tok->ident_literal;
   } break;
   case P_TOKEN_INTEGER: {
     expr->kind = P_EX_INT;
@@ -674,31 +890,62 @@ static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr) {
     if (p_check_peek_tok(parser, P_TOKEN_IDENT)) {
     }
   } break;
-  case P_TOKEN_PLUS: {
-
-  } break;
-  case P_TOKEN_MINUS: {
-
-  } break;
+  case P_TOKEN_AMP:
+  case P_TOKEN_BANG:
+  case P_TOKEN_PLUS:
+  case P_TOKEN_MINUS:
+  case P_TOKEN_TILDE:
   case P_TOKEN_STAR: {
+    p_tok_t cur_tok = *parser->cur_tok;
+    expr->kind = P_EX_UNARY;
+    expr->u.unary_op.ex = bump_alloc(&parser->ast_bump, sizeof(p_ast_expr_t));
+    switch (parser->cur_tok->kind) {
+    case P_TOKEN_AMP: {
+      expr->u.unary_op.op = P_UOP_ADDR;
+    } break;
+    case P_TOKEN_BANG: {
+      expr->u.unary_op.op = P_UOP_LNOT;
+    } break;
+    case P_TOKEN_PLUS: {
+      expr->u.unary_op.op = P_UOP_POS;
+    } break;
+    case P_TOKEN_MINUS: {
+      expr->u.unary_op.op = P_UOP_NEG;
+    } break;
+    case P_TOKEN_TILDE: {
+      expr->u.unary_op.op = P_UOP_BNOT;
+    } break;
+    case P_TOKEN_STAR: {
+      expr->u.unary_op.op = P_UOP_DEREF;
+    } break;
+    default: {
+      log_error("Invalid token %s at beginning of unary operator",
+                p_cur_tok_fmt(parser));
+      return false;
+    } break;
+    }
 
+    p_next_token(parser);
+    bool expr_success = p_parse_expr(parser, expr->u.unary_op.ex);
+    if (!expr_success) {
+      log_error("Failed to parse expr after token %s",
+                p_tok_fmt(&cur_tok, &parser->ast_allocator).string);
+      return false;
+    }
   } break;
-  case P_TOKEN_AMP: {
-
-  } break;
-  case P_TOKEN_BANG: {
-
-  } break;
-  case P_TOKEN_TILDE: {
-
-  } break;
+  case P_TOKEN_MINUS_MINUS:
   case P_TOKEN_PLUS_PLUS: {
-
+    expr->kind = p_check_cur_tok(parser, P_TOKEN_PLUS_PLUS) ? P_EX_PRE_INC
+                                                            : P_EX_POST_INC;
+    expr->u.pre_post_dec_inc =
+        bump_alloc(&parser->ast_bump, sizeof(p_ast_expr_t));
+    bool expr_success = p_parse_expr(parser, expr->u.pre_post_dec_inc);
+    if (!expr_success) {
+      log_error("Failed to past expr after prefix %s",
+                expr->kind == P_EX_PRE_INC ? "increment" : "decrement");
+      return false;
+    }
   } break;
-  case P_TOKEN_MINUS_MINUS: {
-
-  } break;
-
   case P_TOKEN_INVALID:
   case P_TOKEN_EOF:
   case P_TOKEN_COMMA:
@@ -745,6 +992,102 @@ static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr) {
   } break;
   }
   return true;
+}
+
+static bool p_parse_rec_member(p_parser_t *parser,
+                               struct p_ast_expr_member *mem_expr) {}
+
+// clang-format off
+static bool p_tok_to_bin_op(p_parser_t *parser, const p_tok_t *tok, p_binary_op_e *bin_op) {
+  switch (tok->kind) {
+  // Infix-Logic
+  case P_TOKEN_EQ_EQ:     *bin_op = P_BOP_EQ;    break;
+  case P_TOKEN_BANG_EQ:   *bin_op = P_BOP_NEQ;   break;
+  case P_TOKEN_LT:        *bin_op = P_BOP_LT;    break;
+  case P_TOKEN_GT:        *bin_op = P_BOP_GT;    break;
+  case P_TOKEN_LT_EQ:     *bin_op = P_BOP_LT_EQ; break;
+  case P_TOKEN_GT_EQ:     *bin_op = P_BOP_GT_EQ; break;
+  case P_TOKEN_AMP_AMP:   *bin_op = P_BOP_LAND;  break;
+  case P_TOKEN_PIPE_PIPE: *bin_op = P_BOP_LOR;   break;
+  // Infix-Arithmentic
+  case P_TOKEN_PLUS:      *bin_op = P_BOP_ADD;   break;
+  case P_TOKEN_MINUS:     *bin_op = P_BOP_SUB;   break;
+  case P_TOKEN_STAR:      *bin_op = P_BOP_MUL;   break;
+  case P_TOKEN_SLASH:     *bin_op = P_BOP_DIV;   break;
+  case P_TOKEN_PERCENT:   *bin_op = P_BOP_MOD;   break;
+  // Infix-Bitwise
+  case P_TOKEN_LT_LT:     *bin_op = P_BOP_SHL;   break;
+  case P_TOKEN_GT_GT:     *bin_op = P_BOP_SHR;   break;
+  case P_TOKEN_CARET:     *bin_op = P_BOP_BXOR;  break;
+  case P_TOKEN_AMP:       *bin_op = P_BOP_BAND;  break;
+  case P_TOKEN_PIPE:      *bin_op = P_BOP_BOR;   break;
+  default: {
+    log_error("Cannot convert token to binary operator");
+    return false;
+  }
+  }
+
+  return true;
+}
+// clang-format on
+
+static bool p_parse_expr(p_parser_t *parser, p_ast_expr_t *expr) {
+  p_ast_expr_t left_expr = {0};
+  bool left_success = p_parse_base_expr(parser, &left_expr);
+  if (!left_success) {
+    log_error("Failed to parse base expr");
+    return false;
+  }
+
+  switch (parser->cur_tok->kind) {
+    // Special
+  case P_TOKEN_DOT:
+  case P_TOKEN_ARROW:
+    // Postfix
+  case P_TOKEN_LPAREN:
+  case P_TOKEN_LSQUARE:
+  case P_TOKEN_PLUS_PLUS:
+  case P_TOKEN_MINUS_MINUS:
+  // Infix
+  case P_TOKEN_ASSIGN:
+  // Infix-Arithmetic-Assign
+  case P_TOKEN_PLUS_ASSIGN:
+  case P_TOKEN_MINUS_ASSIGN:
+  case P_TOKEN_STAR_ASSIGN:
+  case P_TOKEN_SLASH_ASSIGN:
+  case P_TOKEN_PERCENT_ASSIGN:
+  // Infix-Bitwise-Assign
+  case P_TOKEN_LT_LT_ASSIGN:
+  case P_TOKEN_GT_GT_ASSIGN:
+  case P_TOKEN_CARET_ASSIGN:
+  case P_TOKEN_AMP_ASSIGN:
+  case P_TOKEN_PIPE_ASSIGN: {
+    
+  } break;
+  // Infix-Logic
+  case P_TOKEN_EQ_EQ:
+  case P_TOKEN_BANG_EQ:
+  case P_TOKEN_LT:
+  case P_TOKEN_GT:
+  case P_TOKEN_LT_EQ:
+  case P_TOKEN_GT_EQ:
+  case P_TOKEN_AMP_AMP:
+  case P_TOKEN_PIPE_PIPE:
+  // Infix-Arithmentic
+  case P_TOKEN_PLUS:
+  case P_TOKEN_MINUS:
+  case P_TOKEN_STAR:
+  case P_TOKEN_SLASH:
+  case P_TOKEN_PERCENT:
+  // Infix-Bitwise
+  case P_TOKEN_LT_LT:
+  case P_TOKEN_GT_GT:
+  case P_TOKEN_CARET:
+  case P_TOKEN_AMP:
+  case P_TOKEN_PIPE: {
+    
+  } break;
+  }
 }
 
 static bool p_parse_init(p_parser_t *parser, p_ast_init_t *init) {
@@ -1137,7 +1480,9 @@ static bool p_parse_stmt(p_parser_t *parser, p_ast_stmt_t *stmt) {
       stmt->kind = P_ST_CONTINUE;
     } else if (str_eq(ident, "goto")) {
       TODO();
-    } else if (p_builtin_type_idx(ident) != -1) {
+    } else if (p_is_type_ident(parser, ident, NULL) ||
+               p_parse_decl_sc(*parser->cur_tok, NULL) ||
+               p_parse_type_qual(*parser->cur_tok, NULL)) {
       stmt->kind = P_ST_DECL;
       success = p_parse_decl(parser, &stmt->u.decl_stmt.decl);
     }
@@ -1237,212 +1582,14 @@ static bool p_parse_stmt(p_parser_t *parser, p_ast_stmt_t *stmt) {
 }
 
 static bool p_parse_decl(p_parser_t *parser, p_ast_decl_t *decl) {
-  // TODO: Parse typedef with multiple names
-  if (p_check_cur_tok(parser, P_TOKEN_IDENT) &&
-      str_eq(parser->cur_tok->ident_literal, "typedef")) {
-    decl->sc = P_SC_TYPEDEF;
-
-    p_next_token(parser);
-
-    char *typedef_name = NULL;
-    bool type_success = p_parse_type(parser, &decl->base_type, &typedef_name,
-                                     NULL, P_TY_PARSE_CTX_DECL);
-    if (!type_success) {
-      log_error("Failed to parse type for typedef");
-      return false;
-    }
-
-    if (typedef_name == NULL && p_expect_peek_tok(parser, P_TOKEN_IDENT)) {
-      typedef_name = parser->cur_tok->ident_literal;
-      p_next_token(parser);
-    }
-
-    decl->decls =
-        array_new_capacity(p_ast_declarator_t, 2, &parser->ast_allocator);
-    decl->decls[0].type = decl->base_type;
-    decl->decls[0].has_init = false;
-    decl->decls[0].name = typedef_name;
-    _internal_array_set_len(decl->decls, 1);
-
-    if (!p_expect_peek_tok(parser, P_TOKEN_SEMICOLON)) {
-      log_error("Expected semicolon after typedef");
-      return false;
-    }
-
-    return true;
-  }
-
-  char *first_decl_name = NULL;
-
-  // TODO: pass sc and qual to function and make it also parse the stuff
-  // TODO: FIX TYPE PARSING HERE
-  bool ty_success = p_parse_type(parser, &decl->base_type, &first_decl_name,
-                                 &decl->sc, P_TY_PARSE_CTX_DECL);
-  if (!ty_success) {
-    log_error("Failed to pass decl, expected storage class, type qualifier "
-              "or type, received token: %s",
-              p_cur_tok_fmt(parser));
+  decl->decls = array_new(p_ast_declarator_t, &parser->ast_allocator);
+  bool args_success =
+      p_parse_declarators(parser, &decl->base_type, &decl->decls, NULL,
+                          &decl->sc, P_TY_PARSE_CTX_DECL);
+  if (!args_success) {
+    log_error("Failed to parse type for typedef");
     return false;
   }
-
-  p_next_token(parser);
-
-  p_ast_declarator_t *declarators =
-      array_new(p_ast_declarator_t, &parser->ast_allocator);
-
-  log_debug("PARSING DECL, cur tok: %s", p_cur_tok_fmt(parser));
-
-  if (p_check_cur_tok(parser, P_TOKEN_SEMICOLON)) {
-    if (first_decl_name != NULL) {
-      p_ast_declarator_t declarator = {0};
-      declarator.name = first_decl_name;
-      declarator.type = decl->base_type;
-      declarator.has_init = false;
-      array_add(declarators, declarator);
-      log_debug("Single thingy");
-    } else {
-      log_debug("decl without name");
-    }
-    decl->decls = declarators;
-    return true;
-  }
-
-  bool found_func_def = false;
-
-  while (!p_check_cur_tok(parser, P_TOKEN_SEMICOLON) && !found_func_def) {
-    p_ast_declarator_t declarator = {
-        .type = decl->base_type,
-    };
-
-    // TODO: Handle type qualifiers
-    while (p_expect_cur_tok(parser, P_TOKEN_STAR)) {
-      p_ast_type_t ptr_ty = {
-          .kind = P_TY_PTR,
-          .u.ptr.base_ty = bump_alloc(&parser->ast_bump, sizeof(p_ast_type_t)),
-      };
-      *ptr_ty.u.ptr.base_ty = declarator.type;
-      declarator.type = ptr_ty;
-    }
-
-    const char *ident = parser->cur_tok->ident_literal;
-    if (!p_check_cur_tok(parser, P_TOKEN_IDENT)) {
-      log_error("Expected name of decl or semicolon, received: %s",
-                p_cur_tok_fmt(parser));
-      return false;
-    }
-
-    p_next_token(parser);
-
-    log_debug("cur tok: %s", p_cur_tok_fmt(parser));
-
-    while (p_expect_cur_tok(parser, P_TOKEN_LSQUARE)) {
-      log_debug("Array begin");
-      p_ast_expr_t count_expr = {0};
-      if (!p_expect_cur_tok(parser, P_TOKEN_RSQUARE)) {
-        // TODO: Better optional expr parsing
-        bool success = p_parse_expr(parser, &count_expr);
-        p_next_token(parser);
-        if (!p_expect_cur_tok(parser, P_TOKEN_RSQUARE)) {
-          log_error(
-              "Expected right square brackets after array count expression");
-          return false;
-        }
-      }
-
-      p_ast_type_t arr_ty = {
-          .kind = P_TY_ARRAY,
-          .u.array =
-              {
-                  .elem_ty =
-                      bump_alloc(&parser->ast_bump, sizeof(p_ast_type_t)),
-                  .count = bump_alloc(&parser->ast_bump, sizeof(p_ast_expr_t)),
-              },
-      };
-      *arr_ty.u.array.elem_ty = declarator.type;
-      *arr_ty.u.array.count = count_expr;
-      declarator.type = arr_ty;
-    }
-
-    declarator.name = ident;
-
-    switch (parser->cur_tok->kind) {
-    case P_TOKEN_ASSIGN: {
-      declarator.has_init = true;
-
-      p_next_token(parser);
-
-      bool init_success = p_parse_init(parser, &declarator.init);
-      if (!init_success) {
-        log_error("Failed to parse init for decl");
-        return false;
-      }
-
-      if (!p_expect_peek_tok(parser, P_TOKEN_SEMICOLON) &&
-          !p_expect_peek_tok(parser, P_TOKEN_COMMA)) {
-        log_error("Expected semicolon or comma after decl init");
-        return false;
-      }
-
-    } break;
-    case P_TOKEN_LPAREN: {
-      p_ast_type_t func_ty = {
-          .kind = P_TY_FUNC,
-          .u.func =
-              {
-                  .ret_type =
-                      bump_alloc(&parser->ast_bump, sizeof(p_ast_type_t)),
-                  .args = array_new(p_ast_field_t, &parser->ast_allocator),
-              },
-      };
-      struct p_ast_type_func *func = &func_ty.u.func;
-      *func->ret_type = decl->base_type;
-
-      p_next_token(parser);
-
-      if (!p_expect_cur_tok(parser, P_TOKEN_RPAREN)) {
-        log_error("Args not supported yet");
-        return false;
-      }
-
-      declarator.type = func_ty;
-
-      switch (parser->cur_tok->kind) {
-      case P_TOKEN_SEMICOLON: {
-        log_debug("Found function decl");
-      } break;
-      case P_TOKEN_LCURLY: {
-        log_debug("Found function def");
-        found_func_def = true;
-      } break;
-      default: {
-
-      } break;
-      }
-    } break;
-    case P_TOKEN_COMMA: {
-      p_next_token(parser);
-    } break;
-    case P_TOKEN_SEMICOLON: {
-      log_debug("Parsed variable decl");
-    } break;
-    default: {
-      log_error("Expected semicolon, assign or left parenthesis after "
-                "declaration name, received token: %s",
-                p_cur_tok_fmt(parser));
-    } break;
-    }
-
-    log_debug("decl Type: %s",
-              p_type_fmt(&declarator.type, &parser->ast_allocator).string);
-
-    log_debug("Name: %s", declarator.name);
-
-    array_add(declarators, declarator);
-  }
-
-  decl->decls = declarators;
-
-  // TODO: Special stuff for function pointer types
 
   return true;
 }

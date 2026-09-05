@@ -16,6 +16,8 @@ typedef struct p_ast_stmt p_ast_stmt_t;
 typedef struct p_ast_decl p_ast_decl_t;
 typedef struct p_ast_init p_ast_init_t;
 
+typedef struct p_ast_declarator p_ast_declarator_t;
+
 /* -- Types --*/
 
 typedef enum {
@@ -47,7 +49,9 @@ typedef enum {
   P_TY_TYPEDEF_NAME,
 } p_type_kind_e;
 
-typedef struct p_ast_field p_ast_field_t;
+typedef struct p_ast_arg p_ast_arg_t;
+
+typedef struct p_ast_rec_field p_ast_rec_field_t;
 
 typedef struct p_ast_enum_item {
   const char *name;
@@ -73,16 +77,17 @@ struct p_ast_type {
     struct p_ast_type_array {
       p_ast_type_t *elem_ty;
       p_ast_expr_t *count;
+      bool has_count;
       bool is_vla;
     } array;
     struct p_ast_type_func {
       p_ast_type_t *ret_type;
-      p_ast_field_t *args;
+      p_ast_arg_t *args;
       bool variadic;
     } func;
     struct p_ast_type_rec {
       const char *tag;
-      p_ast_field_t *fields;
+      p_ast_rec_field_t *fields;
       bool is_complete;
     } rec; // struct/union
     struct p_ast_type_enum {
@@ -94,9 +99,14 @@ struct p_ast_type {
   } u;
 };
 
+struct p_ast_rec_field {
+  p_ast_type_t base_type;
+  p_ast_declarator_t *decls; // decls without init
+};
+
 // TODO: Add type qualifier to fields and pointers
-struct p_ast_field {
-  char *name;
+struct p_ast_arg {
+  const char *name;
   p_ast_type_t ty;
 };
 
@@ -151,9 +161,9 @@ typedef enum p_binary_op {
   P_BOP_SHR,
 
   P_BOP_LT,
-  P_BOP_LTE,
+  P_BOP_LT_EQ,
   P_BOP_GT,
-  P_BOP_GTE,
+  P_BOP_GT_EQ,
 
   P_BOP_EQ,
   P_BOP_NEQ,
@@ -162,8 +172,8 @@ typedef enum p_binary_op {
   P_BOP_BXOR,
   P_BOP_BOR,
 
-  P_LAND,
-  P_LOR,
+  P_BOP_LAND,
+  P_BOP_LOR,
 } p_binary_op_e;
 
 typedef enum p_assign_op {
@@ -225,6 +235,7 @@ struct p_ast_expr {
       p_ast_expr_t *base;
       const char *member_field;
     } member;
+    p_ast_expr_t *pre_post_dec_inc;
 
     struct {
       p_ast_type_t ty;
@@ -278,12 +289,12 @@ typedef enum p_ast_storage_class {
   P_SC_REGISTER,
 } p_ast_storage_class_e;
 
-typedef struct p_ast_declarator {
+struct p_ast_declarator {
   const char *name; // NULL for abstract declarator
   p_ast_type_t type;
   p_ast_init_t init; // optional
   bool has_init;
-} p_ast_declarator_t;
+};
 
 struct p_ast_decl {
   p_ast_storage_class_e sc;
@@ -412,5 +423,6 @@ dyn_string_t p_stmt_fmt(const p_ast_stmt_t *stmt, allocator_t *fmt_alloc);
 dyn_string_t p_extern_fmt(const p_ast_extern_t *external,
                           allocator_t *fmt_alloc);
 
-dyn_string_t p_init_fmt(const p_ast_init_t *init,
-                          allocator_t *fmt_alloc);
+dyn_string_t p_init_fmt(const p_ast_init_t *init, allocator_t *fmt_alloc);
+
+dyn_string_t p_decl_fmt(const p_ast_decl_t *decl, allocator_t *fmt_alloc);
